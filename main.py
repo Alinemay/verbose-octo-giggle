@@ -148,24 +148,17 @@ def get_birthday(birthday, year, today):
 
 
 def get_ciba():
-# url = "http://open.iciba.com/dsapi/"
-# headers = {
-#   'Content-Type': 'application/json',
-#   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-#                 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
-#   }
-#   r = get(url, headers=headers)
-#   note_en = r.json()["content"]
-#   note_ch = r.json()["note"]
-#   return note_ch, note_en
-
-    url = 'http://open.iciba.com/dsapi/'
-    response = requests.get(url)
-    data = response.json()
-    note_en = data["content"]
-    note_ch = data["note"]
+     url = "http://open.iciba.com/dsapi/"
+     headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
+    }
+    r = get(url, headers=headers)
+    note_en = r.json()["content"]
+    note_ch = r.json()["note"]
     return note_ch, note_en
-  
+
 def send_message(to_user, access_token, region_name, weather, temp, wind_dir, note_ch, note_en, max_temp, min_temp,
                  sunrise, sunset, category, pm2p5, proposal, chp):
     url = "https://api.weixin.qq.com/cgi-bin/message/template/send?access_token={}".format(access_token)
@@ -318,5 +311,6 @@ if __name__ == "__main__":
         send_message(user, accessToken, region, weather, temp, wind_dir, note_ch, note_en, max_temp, min_temp, sunrise,
                      sunset, category, pm2p5, proposal, chp)
     os.system("pause")
+
 
 
