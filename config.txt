@@ -19,9 +19,9 @@
 #"region": "浙江省绍兴市柯桥区",
 
 # 生日1
-"birthday": {"name": " 琳 ", "birthday": "r1995-08-12"},
+"birthday": {"name": " 琳 ", "birthday": "1995-08-12"},
 # 生日2
-"birthday2": {"name": " 鹏 ", "birthday": "r1996-04-17"},
+"birthday2": {"name": " 鹏 ", "birthday": "1996-04-17"},
 
 # 在一起的日子，格式同上
 "love_date": "2021-09-04",
@@ -32,6 +32,7 @@
 "note_en": ""
 
 }
+
 
 
 
