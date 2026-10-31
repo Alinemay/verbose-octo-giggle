@@ -16,6 +16,26 @@ def wait_if_windows():
         os.system("pause")
 
 
+# ---------------------------------------------------------------------------
+# 微信模板消息展示规范（2023-05-04 起生效）：
+#   1) 去除自定义颜色、表情符号
+#   2) 去除首行内容
+#   3) 去除尾部/备注内容
+#   4) 中间主内容中，单个字段不超过 20 字，且不支持换行
+# 所以模板里排在最后的字段、以及超过 20 字的长句，都会被平台自动去掉。
+# 下面统一按 20 字压缩，保证"发出去的内容"和"用户看到的内容"一致。
+# ---------------------------------------------------------------------------
+MAX_FIELD_LEN = 20
+
+
+def clip_field(text, limit=MAX_FIELD_LEN):
+    """按模板消息规范压缩字段取值：去掉换行和多余空格，超长部分截断。"""
+    s = " ".join(str(text).split())
+    if len(s) <= limit:
+        return s
+    return s[: max(limit - 1, 1)] + "…"
+
+
 def get_json(url, headers=None, timeout=15, retries=2):
     """带超时和重试地请求接口并解析 JSON。
 
@@ -191,14 +211,14 @@ def get_birthday(birthday, year, today):
     return birth_day
 
 
-# 词霸接口不可用时的本地兜底金句，保证推送不中断
-FALLBACK_NOTES = [
-    ("生活不是等待风暴过去，而是学会在雨中跳舞。",
-     "Life isn't about waiting for the storm to pass, it's about learning to dance in the rain."),
-    ("我们无法选择风向，但可以调整帆的方向。",
-     "We cannot direct the wind, but we can adjust the sails."),
-    ("慢慢来，比较快。",
-     "Slow is smooth, smooth is fast."),
+# 短句金句库：每条中英文都控制在 20 字以内，符合微信模板消息的展示规范。
+# 既作为接口失败时的兜底，也用于替换过长的每日一句（长句在微信里会被截成残句）。
+SHORT_NOTES = [
+    ("慢慢来，比较快", "Slow is fast"),
+    ("行动胜过空想", "Act now"),
+    ("今天也要好好吃饭", "Eat well today"),
+    ("心安即是归处", "Peace is home"),
+    ("热爱可抵岁月长", "Love outlasts time"),
 ]
 
 
@@ -207,7 +227,7 @@ def get_ciba():
 
     原代码直接 r.json()["content"]，接口一旦返回 HTML 错误页或空内容就会抛
     JSONDecodeError 导致整个 GitHub Actions 任务失败。这里改为：
-    先判断状态码，再安全解析，最后用本地兜底金句收尾。
+    先判断状态码，再安全解析，过长或失败时用本地短句兜底。
     """
     headers = {
         'Content-Type': 'application/json',
@@ -221,11 +241,17 @@ def get_ciba():
             continue
         note_en = str(data.get("content") or "").strip()
         note_ch = str(data.get("note") or "").strip()
-        if note_en and note_ch:
-            return note_ch, note_en
-        print("词霸接口返回的数据缺少 content/note 字段：{}".format(data))
-    note_ch, note_en = random.choice(FALLBACK_NOTES)
-    print("词霸每日一句获取失败，已使用本地兜底金句")
+        if not (note_en and note_ch):
+            print("词霸接口返回的数据缺少 content/note 字段：{}".format(data))
+            continue
+        # 微信单个字段上限 20 字，长句会被截断成半句，因此过长的句子改用本地短句
+        if len(note_ch) > MAX_FIELD_LEN or len(note_en) > MAX_FIELD_LEN:
+            print("词霸金句超出 20 字（中文 {} 字，英文 {} 字符），微信会截断，已改用本地短句。"
+                  "原始内容：{} / {}".format(len(note_ch), len(note_en), note_ch, note_en))
+            break
+        return note_ch, note_en
+    note_ch, note_en = random.choice(SHORT_NOTES)
+    print("本次使用本地短句：{} / {}".format(note_ch, note_en))
     return note_ch, note_en
 
 
@@ -325,13 +351,30 @@ def send_message(to_user, access_token, region_name, weather, temp, wind_dir, no
     }
     for key, value in birthdays.items():
         # 获取距离下次生日的时间
-        birth_day = get_birthday(value["birthday"], year, today)
+        name = str(value.get("name", "")).strip()
+        try:
+            birth_day = get_birthday(value["birthday"], year, today)
+        except Exception as e:
+            print("生日 {} 计算失败，已跳过：{}".format(key, e))
+            continue
         if birth_day == 0:
-            birthday_data = "今天{}生日哦，祝{}生日快乐！".format(value["name"], value["name"])
+            birthday_data = "祝{}生日快乐".format(name)
         else:
-            birthday_data = "距离{}的生日还有{}天".format(value["name"], birth_day)
+            birthday_data = "距{}生日还有{}天".format(name, birth_day)
         # 将生日数据插入data
         data["data"][key] = {"value": birthday_data, "color": get_color()}
+
+    # 统一按 20 字规范压缩，保证"发出去的"就是"能看到的"
+    for k, v in data["data"].items():
+        v["value"] = clip_field(v["value"])
+
+    # 发送前自检：打印每个字段的名称、字数与内容，方便比对公众号后台的模板占位符
+    print("---- 本次发送的模板字段（字段名 | 字数 | 内容）----")
+    for k, v in data["data"].items():
+        print("{} | {}字 | {}".format(k, len(v["value"]), v["value"]))
+    print("提示：若上面字段都有值、微信却不显示，请到公众号后台核对占位符名称是否完全一致，"
+          "并检查该字段是不是排在模板最后（尾部内容会被平台自动去除）。")
+
     headers = {
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -344,16 +387,21 @@ def send_message(to_user, access_token, region_name, weather, temp, wind_dir, no
         print("推送消息失败，微信接口返回的不是 JSON，状态码 {}，正文预览：{}"
               .format(resp.status_code, resp.text[:200]))
         return
-    if response.get("errcode") == 40037:
+    # 原样打印微信返回，出问题时这行日志就是唯一证据
+    print("微信接口返回：{}".format(response))
+    errcode = response.get("errcode")
+    if errcode == 40037:
         print("推送消息失败，请检查模板id是否正确")
-    elif response.get("errcode") == 40036:
+    elif errcode == 40036:
         print("推送消息失败，请检查模板id是否为空")
-    elif response.get("errcode") == 40003:
+    elif errcode == 40003:
         print("推送消息失败，请检查微信号是否正确")
-    elif response.get("errcode") == 0:
+    elif errcode == 47003:
+        print("推送消息失败，参数值不合法（47003）：请核对模板字段名与取值格式")
+    elif errcode == 0:
         print("推送消息成功")
     else:
-        print(response)
+        print("推送消息失败，错误码：{}".format(errcode))
 
 
 if __name__ == "__main__":
