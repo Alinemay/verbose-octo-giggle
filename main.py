@@ -1,5 +1,6 @@
 import random
 import re
+from urllib.parse import quote
 from time import localtime
 from requests import get, post
 from datetime import datetime, date
@@ -143,7 +144,12 @@ def fetch_region(location_id, region, name, headers, key, deg, full):
         w["temp"] = str(now.get("temp", "--")) + deg
         w["feels"] = str(now.get("feelsLike", "--")) + deg
         w["humidity"] = str(now.get("humidity", "--")) + "%"
-        w["line"] = "{} {} {}".format(name, w["weather"], w["temp"])
+        # 城市行用 config 里配置的完整地区名，而不是和风返回的短名（如“绍兴”）；
+        # 遇到“雷阵雨伴有冰雹”这类长天气词导致超过 20 字时，退回短名以免被截断
+        line = "{} {} {}".format(region, w["weather"], w["temp"])
+        if len(line) > MAX_FIELD_LEN:
+            line = "{} {} {}".format(name, w["weather"], w["temp"])
+        w["line"] = line
     else:
         print("获取实时天气失败：{}".format(region))
 
@@ -301,6 +307,58 @@ def get_lunar(today):
         return ""
 
 
+# 星座运势：接口返回 result.list，每项是“类型 + 内容”，这里把类型映射成字段后缀。
+# 支持最多两个星座，字段名分别是 star1_all / star2_all 这种形式。
+STAR_FIELDS = {
+    "综合指数": "all",
+    "爱情指数": "love",
+    "工作指数": "work",
+    "财运指数": "money",
+    "健康指数": "health",
+    "幸运颜色": "color",
+    "幸运数字": "num",
+    "贵人星座": "friend",
+    "今日概述": "summary",
+}
+
+
+def get_star():
+    """取星座运势，最多两个。config 里没填或接口失败时，所有字段留空。"""
+    astros = config.get("star", [])
+    if isinstance(astros, str):
+        astros = [astros]
+    astros = [str(a).strip() for a in astros if str(a).strip()][:2]
+
+    out = {}
+    for i in (1, 2):
+        out["star{}_name".format(i)] = ""
+        for suffix in STAR_FIELDS.values():
+            out["star{}_{}".format(i, suffix)] = ""
+    if not astros:
+        return out
+    for i, astro in enumerate(astros, 1):
+        out["star{}_name".format(i)] = astro
+
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
+    }
+    key = config.get("tian_api", "")
+    for i, astro in enumerate(astros, 1):
+        # astro 支持中文或英文名（如 狮子座 / leo），中文需 urlencode
+        url = "https://apis.tianapi.com/star/index?key={}&astro={}".format(key, quote(astro))
+        data = get_json(url, headers, timeout=10, retries=1)
+        if not isinstance(data, dict) or data.get("code") != 200:
+            print("星座运势接口不可用（未申请时返回 160），{} 留空：{}".format(astro, data))
+            continue
+        for item in (data.get("result") or {}).get("list") or []:
+            suffix = STAR_FIELDS.get(item.get("type"))
+            if suffix:
+                out["star{}_{}".format(i, suffix)] = str(item.get("content", "")).strip()
+    return out
+
+
 def get_tianhang():
     try:
         key = config["tian_api"]
@@ -382,6 +440,19 @@ SHORT_CHP = [
 ]
 
 
+def clip_sentence(text, limit=MAX_FIELD_LEN):
+    """超长时退到最后一个标点处截断，保证留下的是完整的一句话或短语。"""
+    s = " ".join(str(text).split())
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    for sep in ("。", "！", "？", "；", "，", "、", " "):
+        idx = head.rfind(sep)
+        if idx >= 6:  # 至少保留 6 个字，太短就不在这里断
+            return head[:idx]
+    return head[:limit]
+
+
 def clip_or_pick(text, pool, limit=MAX_FIELD_LEN):
     """不超过 limit 就原样返回，超长则换一条同类短句，避免出现截断后的半句话。"""
     s = " ".join(str(text).split())
@@ -448,6 +519,26 @@ def send_message(to_user, access_token, w):
         "rain_tip": w.get("rain_tip", ""),
         "proposal": w.get("proposal", ""),
         "chp": w.get("chp", ""),
+        "star1_name": w.get("star1_name", ""),
+        "star1_all": w.get("star1_all", ""),
+        "star1_love": w.get("star1_love", ""),
+        "star1_work": w.get("star1_work", ""),
+        "star1_money": w.get("star1_money", ""),
+        "star1_health": w.get("star1_health", ""),
+        "star1_color": w.get("star1_color", ""),
+        "star1_num": w.get("star1_num", ""),
+        "star1_friend": w.get("star1_friend", ""),
+        "star1_summary": w.get("star1_summary", ""),
+        "star2_name": w.get("star2_name", ""),
+        "star2_all": w.get("star2_all", ""),
+        "star2_love": w.get("star2_love", ""),
+        "star2_work": w.get("star2_work", ""),
+        "star2_money": w.get("star2_money", ""),
+        "star2_health": w.get("star2_health", ""),
+        "star2_color": w.get("star2_color", ""),
+        "star2_num": w.get("star2_num", ""),
+        "star2_friend": w.get("star2_friend", ""),
+        "star2_summary": w.get("star2_summary", ""),
     }
 
     # 每个城市：city1、city1_feels、city1_hum ……
@@ -546,8 +637,13 @@ if __name__ == "__main__":
         note_ch, note_en = get_quote()
     w["note_ch"] = note_ch
     w["note_en"] = note_en
-    # 彩虹屁只取一次，保证两个收件人看到的内容一致
-    w["chp"] = clip_or_pick(get_tianhang(), SHORT_CHP)
+    # 彩虹屁只取一次，保证两个收件人看到的内容一致；
+    # 原句普遍超过 20 字，这里按标点截断，宁可短一点也不留半句话
+    chp_raw = get_tianhang()
+    if not chp_raw:
+        chp_raw = random.choice(SHORT_CHP)
+    w["chp"] = clip_sentence(chp_raw)
+    w.update(get_star())
     # 公众号推送消息
     for user in users:
         send_message(user, accessToken, w)
