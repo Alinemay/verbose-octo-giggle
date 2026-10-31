@@ -1,4 +1,5 @@
 import random
+import re
 from time import localtime
 from requests import get, post
 from datetime import datetime, date
@@ -36,6 +37,11 @@ def clip_field(text, limit=MAX_FIELD_LEN):
     return s[: max(limit - 1, 1)] + "…"
 
 
+def mask_url(url):
+    """日志里不能出现密钥：把 URL 查询串中的 key/secret 参数打码。"""
+    return re.sub(r"((?:key|secret|appsecret|app_secret)=)[^&]+", r"\1***", str(url), flags=re.I)
+
+
 def get_json(url, headers=None, timeout=15, retries=2):
     """带超时和重试地请求接口并解析 JSON。
 
@@ -46,10 +52,10 @@ def get_json(url, headers=None, timeout=15, retries=2):
         try:
             r = get(url, headers=headers, timeout=timeout)
         except Exception as e:
-            print("请求失败({0}/{1}) {2} -> {3}".format(attempt, retries, url, e))
+            print("请求失败({0}/{1}) {2} -> {3}".format(attempt, retries, mask_url(url), e))
             continue
         if r.status_code != 200:
-            print("接口返回非 200({0}/{1}) {2} -> HTTP {3}".format(attempt, retries, url, r.status_code))
+            print("接口返回非 200({0}/{1}) {2} -> HTTP {3}".format(attempt, retries, mask_url(url), r.status_code))
             continue
         try:
             return r.json()
@@ -57,7 +63,7 @@ def get_json(url, headers=None, timeout=15, retries=2):
             # 这里就是原报错的位置：返回的是 HTML 错误页或空串，不是 JSON
             preview = r.text[:200].replace("\n", " ")
             print("接口返回内容不是合法 JSON({0}/{1}) {2} -> 状态码 {3}，内容类型 {4}，正文预览：{5}"
-                  .format(attempt, retries, url, r.status_code,
+                  .format(attempt, retries, mask_url(url), r.status_code,
                           r.headers.get("Content-Type"), preview))
     return None
 
@@ -87,17 +93,31 @@ def get_access_token():
 
 
 def get_weather(region):
+    """获取天气、空气、预警等全部展示数据，返回字典。
+
+    任何一项接口失败都用占位值填充，保证推送照常发出。
+    """
     # 天气
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
     }
     key = config["weather_key"]
+    deg = u"\N{DEGREE SIGN}" + "C"
+    w = {
+        "region": region, "weather": "未知", "temp": "--", "feels": "--",
+        "humidity": "--",
+        "max_temp": "--", "min_temp": "--", "sunrise": "--", "sunset": "--",
+        "uv": "--", "precip": "--", "tomorrow": "--", "moon": "--",
+        "category": "", "aqi": "",
+        "proposal": "", "warning": "", "rain_tip": "",
+        "lunar": "",
+    }
     region_url = "https://geoapi.qweather.com/v2/city/lookup?location={}&key={}".format(region, key)
     response = get_json(region_url, headers=headers)
     if not isinstance(response, dict):
         print("获取地区信息失败，本次推送使用占位数据")
-        return "未知", "--", "--", "--", "--", "--", "--", "", "", ""
+        return w
     if response.get("code") == "404":
         print("推送消息失败，请检查地区名是否有误！")
         wait_if_windows()
@@ -106,52 +126,109 @@ def get_weather(region):
         print("推送消息失败，请检查和风天气key是否正确！")
         wait_if_windows()
         sys.exit(1)
+    # 获取地区的location--id
+    location_id = response["location"][0]["id"]
+
+    # 实时天气：天气现象、气温、体感温度、湿度、能见度、风向
+    url = "https://devapi.qweather.com/v7/weather/now?location={}&key={}".format(location_id, key)
+    response = get_json(url, headers=headers)
+    if isinstance(response, dict) and response.get("code") == "200":
+        now = response["now"]
+        w["weather"] = now.get("text", "未知")
+        w["temp"] = str(now.get("temp", "--")) + deg
+        w["feels"] = str(now.get("feelsLike", "--")) + deg
+        w["humidity"] = str(now.get("humidity", "--")) + "%"
     else:
-        # 获取地区的location--id
-        location_id = response["location"][0]["id"]
-    weather_url = "https://devapi.qweather.com/v7/weather/now?location={}&key={}".format(location_id, key)
-    response = get_json(weather_url, headers=headers)
-    if not isinstance(response, dict) or response.get("code") != "200":
-        print("获取实时天气失败，本次推送使用占位数据")
-        return "未知", "--", "--", "--", "--", "--", "--", "", "", ""
-    # 天气
-    weather = response["now"]["text"]
-    # 当前温度
-    temp = response["now"]["temp"] + u"\N{DEGREE SIGN}" + "C"
-    # 风向
-    wind_dir = response["now"]["windDir"]
-    # 获取逐日天气预报
+        print("获取实时天气失败，使用占位数据")
+
+    # 逐日预报：最高最低温、日出日落、紫外线、降水量、月相、明日天气
     url = "https://devapi.qweather.com/v7/weather/3d?location={}&key={}".format(location_id, key)
     response = get_json(url, headers=headers)
-    if not isinstance(response, dict) or response.get("code") != "200":
-        print("获取逐日预报失败，最高最低温和日出日落用占位数据")
-        return weather, temp, "--", "--", wind_dir, "--", "--", "", "", ""
-    # 最高气温
-    max_temp = response["daily"][0]["tempMax"] + u"\N{DEGREE SIGN}" + "C"
-    # 最低气温
-    min_temp = response["daily"][0]["tempMin"] + u"\N{DEGREE SIGN}" + "C"
-    # 日出时间
-    sunrise = response["daily"][0]["sunrise"]
-    # 日落时间
-    sunset = response["daily"][0]["sunset"]
+    if isinstance(response, dict) and response.get("code") == "200" and response.get("daily"):
+        daily = response["daily"]
+        today_fc = daily[0]
+        w["max_temp"] = str(today_fc.get("tempMax", "--")) + deg
+        w["min_temp"] = str(today_fc.get("tempMin", "--")) + deg
+        w["sunrise"] = today_fc.get("sunrise", "--")
+        w["sunset"] = today_fc.get("sunset", "--")
+        w["uv"] = str(today_fc.get("uvIndex", "--"))
+        # 注意：v7 的 daily 里给的是降水量 precip（毫米），没有降水概率字段
+        w["precip"] = str(today_fc.get("precip", "--")) + "mm"
+        w["moon"] = today_fc.get("moonPhase", "--")
+        if len(daily) > 1:
+            d1 = daily[1]
+            w["tomorrow"] = "{} {}~{}".format(d1.get("textDay", ""), d1.get("tempMin", ""),
+                                              d1.get("tempMax", "")) + deg
+    else:
+        print("获取逐日预报失败，使用占位数据")
+
+    # 空气质量：等级、pm2.5、AQI
     url = "https://devapi.qweather.com/v7/air/now?location={}&key={}".format(location_id, key)
     response = get_json(url, headers=headers)
     if isinstance(response, dict) and response.get("code") == "200":
-        # 空气质量
-        category = response["now"]["category"]
-        # pm2.5
-        pm2p5 = response["now"]["pm2p5"]
+        w["category"] = response["now"].get("category", "")
+        w["aqi"] = str(response["now"].get("aqi", ""))
     else:
         # 国外城市获取不到数据
-        category = ""
-        pm2p5 = ""
-    id = random.randint(1, 16)
-    url = "https://devapi.qweather.com/v7/indices/1d?location={}&key={}&type={}".format(location_id, key, id)
+        print("获取空气质量失败，该字段留空")
+
+    # 生活指数：随机取一类，只保留建议文字
+    index_type = random.randint(1, 16)
+    url = "https://devapi.qweather.com/v7/indices/1d?location={}&key={}&type={}".format(
+        location_id, key, index_type)
     response = get_json(url, headers=headers)
-    proposal = ""
-    if isinstance(response, dict) and response.get("code") == "200":
-        proposal += response["daily"][0]["text"]
-    return weather, temp, max_temp, min_temp, wind_dir, sunrise, sunset, category, pm2p5, proposal
+    if isinstance(response, dict) and response.get("code") == "200" and response.get("daily"):
+        w["proposal"] = response["daily"][0].get("text", "")
+
+    # 灾害预警与分钟级降水
+    w["warning"] = get_warning(location_id, key, headers)
+    w["rain_tip"] = get_rain_tip(location_id, key, headers)
+
+    # 农历与周末，纯本地计算，不依赖网络
+    today = date.today()
+    w["lunar"] = get_lunar(today)
+    return w
+
+
+def get_warning(location_id, key, headers):
+    """取当前生效的灾害预警标题，多条时标注总数。无预警返回空串。"""
+    url = "https://devapi.qweather.com/v7/warning/now?location={}&key={}".format(location_id, key)
+    response = get_json(url, headers=headers)
+    if not isinstance(response, dict) or response.get("code") != "200":
+        print("获取灾害预警失败（可能不在套餐内），该字段留空")
+        return ""
+    warnings = response.get("warning") or []
+    if not warnings:
+        return ""
+    title = str(warnings[0].get("title", "")).strip()
+    if len(warnings) > 1:
+        title = "{}等{}条".format(title, len(warnings))
+    return title
+
+
+def get_rain_tip(location_id, key, headers):
+    """取分钟级降水的一句话总结，接口不可用时返回空串。"""
+    url = "https://devapi.qweather.com/v7/minutely/5m?location={}&key={}".format(location_id, key)
+    response = get_json(url, headers=headers)
+    if not isinstance(response, dict) or response.get("code") != "200":
+        print("获取分钟级降水失败（可能不在套餐内），该字段留空")
+        return ""
+    return str(response.get("summary", "")).strip()
+
+
+def get_lunar(today):
+    """本地换算农历日期，例如“农历九月十一”。失败返回空串。"""
+    try:
+        if hasattr(ZhDate, "from_datetime"):
+            lunar = ZhDate.from_datetime(datetime(today.year, today.month, today.day))
+        else:
+            lunar = ZhDate.today()
+        if hasattr(lunar, "chinese"):
+            return "农历" + lunar.chinese().split("年")[-1]
+        return "农历" + str(lunar)
+    except Exception as e:
+        print("农历换算失败，该字段留空：{}".format(e))
+        return ""
 
 
 def get_tianhang():
@@ -221,6 +298,22 @@ SHORT_NOTES = [
     ("热爱可抵岁月长", "Love outlasts time"),
 ]
 
+# 彩虹屁原句通常几十字，直接截断会变成半句话，超长时改用这些短句
+SHORT_CHP = [
+    "今天的你闪闪发光",
+    "元气满满的一天",
+    "你笑起来真好看",
+    "今天也是被你可爱到的一天",
+]
+
+
+def clip_or_pick(text, pool, limit=MAX_FIELD_LEN):
+    """不超过 limit 就原样返回，超长则换一条同类短句，避免出现截断后的半句话。"""
+    s = " ".join(str(text).split())
+    if len(s) <= limit:
+        return s
+    return random.choice(pool)
+
 
 def get_ciba():
     """获取词霸每日一句。
@@ -235,8 +328,10 @@ def get_ciba():
                       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
     }
     # 优先 https，失败再退回 http（http 会 301 跳转到 https）
+    # 该域名在 GitHub 运行器上经常直接超时，所以缩短超时并只试一次，
+    # 避免为了一个可有可无的金句白等一分钟
     for url in ("https://open.iciba.com/dsapi/", "http://open.iciba.com/dsapi/"):
-        data = get_json(url, headers)
+        data = get_json(url, headers, timeout=8, retries=1)
         if not isinstance(data, dict):
             continue
         note_en = str(data.get("content") or "").strip()
@@ -255,14 +350,10 @@ def get_ciba():
     return note_ch, note_en
 
 
-def send_message(to_user, access_token, region_name, weather, temp, wind_dir, note_ch, note_en, max_temp, min_temp,
-                 sunrise, sunset, category, pm2p5, proposal, chp):
+def send_message(to_user, access_token, w):
     url = "https://api.weixin.qq.com/cgi-bin/message/template/send?access_token={}".format(access_token)
     week_list = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
-    year = localtime().tm_year
-    month = localtime().tm_mon
-    day = localtime().tm_mday
-    today = datetime.date(datetime(year=year, month=month, day=day))
+    today = date.today()
     week = week_list[today.isoweekday() % 7]
     # 获取在一起的日子的日期格式
     love_year = int(config["love_date"].split("-")[0])
@@ -271,102 +362,58 @@ def send_message(to_user, access_token, region_name, weather, temp, wind_dir, no
     love_date = date(love_year, love_month, love_day)
     # 获取在一起的日期差
     love_days = str(today.__sub__(love_date)).split(" ")[0]
-    # 获取所有生日数据
-    birthdays = {}
-    for k, v in config.items():
-        if k[0:5] == "birth":
-            birthdays[k] = v
+
+    # 先按“字段名 → 文案”组织，最后统一包装成微信要求的 data 结构
+    fields = {
+        "date": "{} {}".format(today, week),
+        "lunar": w.get("lunar", ""),
+        "note_ch": w.get("note_ch", ""),
+        "note_en": w.get("note_en", ""),
+        "region": w.get("region", ""),
+        "weather": w.get("weather", ""),
+        "temp": w.get("temp", ""),
+        "feels": w.get("feels", ""),
+        "min_temp": w.get("min_temp", ""),
+        "max_temp": w.get("max_temp", ""),
+        "humidity": w.get("humidity", ""),
+        "uv": w.get("uv", ""),
+        "precip": w.get("precip", ""),
+        "category": w.get("category", ""),
+        "aqi": w.get("aqi", ""),
+        "sunrise": w.get("sunrise", ""),
+        "sunset": w.get("sunset", ""),
+        "moon": w.get("moon", ""),
+        "tomorrow": w.get("tomorrow", ""),
+        "rain_tip": w.get("rain_tip", ""),
+        "warning": w.get("warning", ""),
+        "proposal": w.get("proposal", ""),
+        "chp": w.get("chp", ""),
+        "love_day": love_days,
+    }
+
+    # 生日字段按 config 里的 birthday* 动态插入
+    for key, value in config.items():
+        if key[0:5] != "birth":
+            continue
+        name = str(value.get("name", "")).strip()
+        try:
+            birth_day = get_birthday(value["birthday"], today.year, today)
+        except Exception as e:
+            print("生日 {} 计算失败，已跳过：{}".format(key, e))
+            continue
+        if birth_day == 0:
+            fields[key] = "祝{}生日快乐".format(name)
+        else:
+            fields[key] = "距{}生日还有{}天".format(name, birth_day)
+
+    # 统一按 20 字规范压缩，保证“发出去的”就是“能看到的”
     data = {
         "touser": to_user,
         "template_id": config["template_id"],
         "url": "http://weixin.qq.com/download",
         "topcolor": "#FF0000",
-        "data": {
-            "date": {
-                "value": "{} {}".format(today, week),
-                "color": get_color()
-            },
-            "region": {
-                "value": region_name,
-                "color": get_color()
-            },
-            "weather": {
-                "value": weather,
-                "color": get_color()
-            },
-            "temp": {
-                "value": temp,
-                "color": get_color()
-            },
-            "wind_dir": {
-                "value": wind_dir,
-                "color": get_color()
-            },
-            "love_day": {
-                "value": love_days,
-                "color": get_color()
-            },
-            "note_en": {
-                "value": note_en,
-                "color": get_color()
-            },
-            "note_ch": {
-                "value": note_ch,
-                "color": get_color()
-            },
-            "max_temp": {
-                "value": max_temp,
-                "color": get_color()
-            },
-            "min_temp": {
-                "value": min_temp,
-                "color": get_color()
-            },
-            "sunrise": {
-                "value": sunrise,
-                "color": get_color()
-            },
-            "sunset": {
-                "value": sunset,
-                "color": get_color()
-            },
-            "category": {
-                "value": category,
-                "color": get_color()
-            },
-            "pm2p5": {
-                "value": pm2p5,
-                "color": get_color()
-            },
-            "proposal": {
-                "value": proposal,
-                "color": get_color()
-            },
-            "chp": {
-                "value": chp,
-                "color": get_color()
-            },
-
-        }
+        "data": {k: {"value": clip_field(v), "color": get_color()} for k, v in fields.items()},
     }
-    for key, value in birthdays.items():
-        # 获取距离下次生日的时间
-        name = str(value.get("name", "")).strip()
-        try:
-            birth_day = get_birthday(value["birthday"], year, today)
-        except Exception as e:
-            print("生日 {} 计算失败，已跳过：{}".format(key, e))
-            continue
-        if birth_day == 0:
-            birthday_data = "祝{}生日快乐".format(name)
-        else:
-            birthday_data = "距{}生日还有{}天".format(name, birth_day)
-        # 将生日数据插入data
-        data["data"][key] = {"value": birthday_data, "color": get_color()}
-
-    # 统一按 20 字规范压缩，保证"发出去的"就是"能看到的"
-    for k, v in data["data"].items():
-        v["value"] = clip_field(v["value"])
 
     # 发送前自检：打印每个字段的名称、字数与内容，方便比对公众号后台的模板占位符
     print("---- 本次发送的模板字段（字段名 | 字数 | 内容）----")
@@ -421,17 +468,18 @@ if __name__ == "__main__":
     accessToken = get_access_token()
     # 接收的用户
     users = config["user"]
-    # 传入地区获取天气信息
-    region = config["region"]
-    weather, temp, max_temp, min_temp, wind_dir, sunrise, sunset, category, pm2p5, proposal = get_weather(region)
+    # 一次性拿到天气、空气、预警、指数、农历等全部展示数据
+    w = get_weather(config["region"])
     note_ch = config.get("note_ch", "")
     note_en = config.get("note_en", "")
     if not note_ch or not note_en:
         # 获取词霸每日金句（任一为空即补全，失败会返回本地兜底金句）
         note_ch, note_en = get_ciba()
-    chp = get_tianhang()
+    w["note_ch"] = note_ch
+    w["note_en"] = note_en
+    # 彩虹屁只取一次，保证两个收件人看到的内容一致
+    w["chp"] = clip_or_pick(get_tianhang(), SHORT_CHP)
     # 公众号推送消息
     for user in users:
-        send_message(user, accessToken, region, weather, temp, wind_dir, note_ch, note_en, max_temp, min_temp, sunrise,
-                     sunset, category, pm2p5, proposal, chp)
+        send_message(user, accessToken, w)
     wait_if_windows()
