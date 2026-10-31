@@ -92,44 +92,49 @@ def get_access_token():
     return access_token
 
 
-def get_weather(region):
-    """获取天气、空气、预警等全部展示数据，返回字典。
+# 每个城市块的字段后缀，与微信模板里的 {{cityN_xxx.DATA}} 一一对应
+CITY_SUFFIXES = ("feels", "hum", "min", "max", "uv", "rain", "rise", "set",
+                 "air", "aqi", "moon")
 
-    任何一项接口失败都用占位值填充，保证推送照常发出。
-    """
-    # 天气
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
-    }
-    key = config["weather_key"]
-    deg = u"\N{DEGREE SIGN}" + "C"
-    w = {
-        "region": region, "weather": "未知", "temp": "--", "feels": "--",
-        "humidity": "--",
-        "max_temp": "--", "min_temp": "--", "sunrise": "--", "sunset": "--",
-        "uv": "--", "precip": "--", "tomorrow": "--", "moon": "--",
-        "category": "", "aqi": "",
-        "proposal": "", "warning": "", "rain_tip": "",
-        "lunar": "",
-    }
-    region_url = "https://geoapi.qweather.com/v2/city/lookup?location={}&key={}".format(region, key)
-    response = get_json(region_url, headers=headers)
+
+def lookup_city(region, headers, key):
+    """按地区名查城市，返回 (location_id, 城市短名)；查不到返回 (None, None)。"""
+    url = "https://geoapi.qweather.com/v2/city/lookup?location={}&key={}".format(region, key)
+    response = get_json(url, headers=headers)
     if not isinstance(response, dict):
-        print("获取地区信息失败，本次推送使用占位数据")
-        return w
-    if response.get("code") == "404":
-        print("推送消息失败，请检查地区名是否有误！")
-        wait_if_windows()
-        sys.exit(1)
-    elif response.get("code") == "401":
+        print("获取地区信息失败：{}".format(region))
+        return None, None
+    if response.get("code") == "401":
         print("推送消息失败，请检查和风天气key是否正确！")
         wait_if_windows()
         sys.exit(1)
-    # 获取地区的location--id
-    location_id = response["location"][0]["id"]
+    if response.get("code") != "200":
+        print("地区名可能有误，找不到：{}（code={}）".format(region, response.get("code")))
+        return None, None
+    try:
+        loc = response["location"][0]
+        return loc["id"], loc.get("name") or region
+    except (KeyError, IndexError, TypeError):
+        print("地区信息解析失败：{}".format(region))
+        return None, None
 
-    # 实时天气：天气现象、气温、体感温度、湿度、能见度、风向
+
+def fetch_region(location_id, region, name, headers, key, deg, full):
+    """取一个地区的数据。
+
+    每个地区都会拿到六行同构内容（城市+天气+气温、体感+湿度、温度区间、
+    空气+AQI、紫外线+降水、日出+日落）；full=True 时再补生活指数、
+    灾害预警、分钟降水这类整条推送只需要一份的数据。
+    """
+    w = {
+        "region": region, "city_name": name,
+        "weather": "未知", "temp": "--", "feels": "--", "humidity": "--",
+        "max_temp": "--", "min_temp": "--", "sunrise": "--", "sunset": "--",
+        "uv": "--", "precip": "--", "tomorrow": "--", "moon": "--",
+        "category": "", "aqi": "", "proposal": "", "warning": "", "rain_tip": "",
+        "line": name,
+    }
+    # 实时天气：天气现象、气温、体感温度、湿度
     url = "https://devapi.qweather.com/v7/weather/now?location={}&key={}".format(location_id, key)
     response = get_json(url, headers=headers)
     if isinstance(response, dict) and response.get("code") == "200":
@@ -138,10 +143,11 @@ def get_weather(region):
         w["temp"] = str(now.get("temp", "--")) + deg
         w["feels"] = str(now.get("feelsLike", "--")) + deg
         w["humidity"] = str(now.get("humidity", "--")) + "%"
+        w["line"] = "{} {} {}".format(name, w["weather"], w["temp"])
     else:
-        print("获取实时天气失败，使用占位数据")
+        print("获取实时天气失败：{}".format(region))
 
-    # 逐日预报：最高最低温、日出日落、紫外线、降水量、月相、明日天气
+    # 逐日预报：温度区间、日出日落、紫外线、降水量、月相、明日天气
     url = "https://devapi.qweather.com/v7/weather/3d?location={}&key={}".format(location_id, key)
     response = get_json(url, headers=headers)
     if isinstance(response, dict) and response.get("code") == "200" and response.get("daily"):
@@ -160,9 +166,9 @@ def get_weather(region):
             w["tomorrow"] = "{} {}~{}".format(d1.get("textDay", ""), d1.get("tempMin", ""),
                                               d1.get("tempMax", "")) + deg
     else:
-        print("获取逐日预报失败，使用占位数据")
+        print("获取逐日预报失败：{}".format(region))
 
-    # 空气质量：等级、pm2.5、AQI
+    # 空气质量：等级与 AQI，每个地区都要一份
     url = "https://devapi.qweather.com/v7/air/now?location={}&key={}".format(location_id, key)
     response = get_json(url, headers=headers)
     if isinstance(response, dict) and response.get("code") == "200":
@@ -170,8 +176,12 @@ def get_weather(region):
         w["aqi"] = str(response["now"].get("aqi", ""))
     else:
         # 国外城市获取不到数据
-        print("获取空气质量失败，该字段留空")
+        print("获取空气质量失败，该字段留空：{}".format(region))
 
+    if not full:
+        return w
+
+    # 以下三项整条推送只需要一份，只对主地区取，避免请求数按城市数量翻倍
     # 生活指数：随机取一类，只保留建议文字
     index_type = random.randint(1, 16)
     url = "https://devapi.qweather.com/v7/indices/1d?location={}&key={}&type={}".format(
@@ -183,10 +193,60 @@ def get_weather(region):
     # 灾害预警与分钟级降水
     w["warning"] = get_warning(location_id, key, headers)
     w["rain_tip"] = get_rain_tip(location_id, key, headers)
+    return w
 
-    # 农历与周末，纯本地计算，不依赖网络
-    today = date.today()
-    w["lunar"] = get_lunar(today)
+
+def get_weather(regions):
+    """按地区列表取数据，每个地区输出结构完全相同的六行。"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
+    }
+    key = config["weather_key"]
+    deg = u"\N{DEGREE SIGN}" + "C"
+    w = {
+        "region": regions[0] if regions else "", "weather": "未知", "temp": "--",
+        "feels": "--", "humidity": "--", "max_temp": "--", "min_temp": "--",
+        "sunrise": "--", "sunset": "--", "uv": "--", "precip": "--",
+        "tomorrow": "--", "moon": "--", "category": "", "aqi": "",
+        "proposal": "", "warning": "", "rain_tip": "", "lunar": "",
+    }
+    for i in range(1, 5):
+        w["city{}".format(i)] = ""
+        for suffix in CITY_SUFFIXES:
+            w["city{}_{}".format(i, suffix)] = ""
+
+    briefs = []
+    detail_done = False
+    for region in regions:
+        location_id, name = lookup_city(region, headers, key)
+        if not location_id:
+            continue
+        data = fetch_region(location_id, region, name, headers, key, deg, full=not detail_done)
+        briefs.append(data)
+        if not detail_done:
+            # 第一个成功查询的地区作为主地区，提供明日天气、建议、预警等全局内容
+            w.update(data)
+            detail_done = True
+
+    if not detail_done:
+        print("所有地区均获取失败，本次推送使用占位数据")
+    for i, data in enumerate(briefs[:4]):
+        n = i + 1
+        w["city{}".format(n)] = data["line"]
+        w["city{}_feels".format(n)] = data["feels"]
+        w["city{}_hum".format(n)] = data["humidity"]
+        w["city{}_min".format(n)] = data["min_temp"]
+        w["city{}_max".format(n)] = data["max_temp"]
+        w["city{}_uv".format(n)] = data["uv"]
+        w["city{}_rain".format(n)] = data["precip"]
+        w["city{}_rise".format(n)] = data["sunrise"]
+        w["city{}_set".format(n)] = data["sunset"]
+        w["city{}_air".format(n)] = data["category"]
+        w["city{}_aqi".format(n)] = data["aqi"]
+        w["city{}_moon".format(n)] = data["moon"]
+
+    w["lunar"] = get_lunar(date.today())
     return w
 
 
@@ -367,34 +427,26 @@ def send_message(to_user, access_token, w):
     fields = {
         "date": "{} {}".format(today, week),
         "lunar": w.get("lunar", ""),
+        "warning": w.get("warning", ""),
         "note_ch": w.get("note_ch", ""),
         "note_en": w.get("note_en", ""),
-        "region": w.get("region", ""),
-        "weather": w.get("weather", ""),
-        "temp": w.get("temp", ""),
-        "feels": w.get("feels", ""),
-        "min_temp": w.get("min_temp", ""),
-        "max_temp": w.get("max_temp", ""),
-        "humidity": w.get("humidity", ""),
-        "uv": w.get("uv", ""),
-        "precip": w.get("precip", ""),
-        "category": w.get("category", ""),
-        "aqi": w.get("aqi", ""),
-        "sunrise": w.get("sunrise", ""),
-        "sunset": w.get("sunset", ""),
-        "moon": w.get("moon", ""),
+        "love_day": love_days,
         "tomorrow": w.get("tomorrow", ""),
         "rain_tip": w.get("rain_tip", ""),
-        "warning": w.get("warning", ""),
         "proposal": w.get("proposal", ""),
         "chp": w.get("chp", ""),
-        "love_day": love_days,
     }
 
-    # 生日字段按 config 里的 birthday* 动态插入
-    for key, value in config.items():
-        if key[0:5] != "birth":
-            continue
+    # 每个城市：city1、city1_feels、city1_hum ……
+    for n in range(1, 5):
+        fields["city{}".format(n)] = w.get("city{}".format(n), "")
+        for suffix in CITY_SUFFIXES:
+            key = "city{}_{}".format(n, suffix)
+            fields[key] = w.get(key, "")
+
+    birth_keys = sorted(k for k in config if k.startswith("birth"))
+    for i, key in enumerate(birth_keys[:2]):
+        value = config[key]
         name = str(value.get("name", "")).strip()
         try:
             birth_day = get_birthday(value["birthday"], today.year, today)
@@ -402,9 +454,9 @@ def send_message(to_user, access_token, w):
             print("生日 {} 计算失败，已跳过：{}".format(key, e))
             continue
         if birth_day == 0:
-            fields[key] = "祝{}生日快乐".format(name)
+            fields["birthday{}".format(i + 1)] = "祝{}生日快乐".format(name)
         else:
-            fields[key] = "距{}生日还有{}天".format(name, birth_day)
+            fields["birthday{}".format(i + 1)] = "距{}生日还有{}天".format(name, birth_day)
 
     # 统一按 20 字规范压缩，保证“发出去的”就是“能看到的”
     data = {
@@ -468,8 +520,12 @@ if __name__ == "__main__":
     accessToken = get_access_token()
     # 接收的用户
     users = config["user"]
+    # 地区支持单个字符串或多个地区的列表
+    regions = config["region"]
+    if isinstance(regions, str):
+        regions = [regions]
     # 一次性拿到天气、空气、预警、指数、农历等全部展示数据
-    w = get_weather(config["region"])
+    w = get_weather(regions)
     note_ch = config.get("note_ch", "")
     note_en = config.get("note_en", "")
     if not note_ch or not note_en:
