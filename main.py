@@ -283,9 +283,19 @@ def get_lunar(today):
             lunar = ZhDate.from_datetime(datetime(today.year, today.month, today.day))
         else:
             lunar = ZhDate.today()
-        if hasattr(lunar, "chinese"):
-            return "农历" + lunar.chinese().split("年")[-1]
-        return "农历" + str(lunar)
+        text = lunar.chinese() if hasattr(lunar, "chinese") else str(lunar)
+        # zhdate 各版本 chinese() 的返回格式不一致，可能带括号或“农历”前缀，
+        # 这里只保留汉字再做裁剪，避免出现“农历)”这种残值
+        text = re.sub(r"[^\u4e00-\u9fa5]", "", text)
+        if text.startswith("农历"):
+            text = text[2:]
+        if "星期" in text:
+            text = text.split("星期")[0]
+        if "年" in text:
+            text = text.split("年", 1)[1]
+        if not text:
+            return ""
+        return "农历" + text
     except Exception as e:
         print("农历换算失败，该字段留空：{}".format(e))
         return ""
@@ -348,14 +358,19 @@ def get_birthday(birthday, year, today):
     return birth_day
 
 
-# 短句金句库：每条中英文都控制在 20 字以内，符合微信模板消息的展示规范。
-# 既作为接口失败时的兜底，也用于替换过长的每日一句（长句在微信里会被截成残句）。
+# 本地金句库：不依赖任何网络，按日期轮换，中英文都控制在 20 字以内。
+# 天行数据接口不可用、或返回句子过长时，用它兜底，保证推送永远有内容。
 SHORT_NOTES = [
     ("慢慢来，比较快", "Slow is fast"),
     ("行动胜过空想", "Act now"),
     ("今天也要好好吃饭", "Eat well today"),
     ("心安即是归处", "Peace is home"),
     ("热爱可抵岁月长", "Love outlasts time"),
+    ("把日子过成诗", "Make life a poem"),
+    ("早起的风最清醒", "Morning air is clear"),
+    ("一点一点靠近想要的生活", "Step by step"),
+    ("今天的太阳很温柔", "Gentle sun today"),
+    ("认真生活的人最可爱", "Live with care"),
 ]
 
 # 彩虹屁原句通常几十字，直接截断会变成半句话，超长时改用这些短句
@@ -375,38 +390,36 @@ def clip_or_pick(text, pool, limit=MAX_FIELD_LEN):
     return random.choice(pool)
 
 
-def get_ciba():
-    """获取词霸每日一句。
+def get_quote():
+    """取每日金句。
 
-    原代码直接 r.json()["content"]，接口一旦返回 HTML 错误页或空内容就会抛
-    JSONDecodeError 导致整个 GitHub Actions 任务失败。这里改为：
-    先判断状态码，再安全解析，过长或失败时用本地短句兜底。
+    优先级：天行数据「每日英语」→ 本地短句库按日期轮换。
+    原词霸接口 open.iciba.com 在 GitHub 运行器上长期连接超时，已移除。
     """
     headers = {
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
     }
-    # 优先 https，失败再退回 http（http 会 301 跳转到 https）
-    # 该域名在 GitHub 运行器上经常直接超时，所以缩短超时并只试一次，
-    # 避免为了一个可有可无的金句白等一分钟
-    for url in ("https://open.iciba.com/dsapi/", "http://open.iciba.com/dsapi/"):
-        data = get_json(url, headers, timeout=8, retries=1)
-        if not isinstance(data, dict):
-            continue
-        note_en = str(data.get("content") or "").strip()
-        note_ch = str(data.get("note") or "").strip()
-        if not (note_en and note_ch):
-            print("词霸接口返回的数据缺少 content/note 字段：{}".format(data))
-            continue
-        # 微信单个字段上限 20 字，长句会被截断成半句，因此过长的句子改用本地短句
-        if len(note_ch) > MAX_FIELD_LEN or len(note_en) > MAX_FIELD_LEN:
-            print("词霸金句超出 20 字（中文 {} 字，英文 {} 字符），微信会截断，已改用本地短句。"
-                  "原始内容：{} / {}".format(len(note_ch), len(note_en), note_ch, note_en))
-            break
-        return note_ch, note_en
-    note_ch, note_en = random.choice(SHORT_NOTES)
-    print("本次使用本地短句：{} / {}".format(note_ch, note_en))
+    key = config.get("tian_api", "")
+    if key:
+        url = "https://apis.tianapi.com/everyday/index?key={}".format(key)
+        data = get_json(url, headers, timeout=10, retries=1)
+        if isinstance(data, dict) and data.get("code") == 200:
+            result = data.get("result") or {}
+            note_ch = str(result.get("note") or "").strip()
+            note_en = str(result.get("content") or "").strip()
+            if note_ch and len(note_ch) <= MAX_FIELD_LEN:
+                # 英文原句通常几十上百字符，模板里放不下，超长就留空，避免残句
+                if len(note_en) > MAX_FIELD_LEN:
+                    note_en = ""
+                return note_ch, note_en
+            print("天行返回的金句为空或超过 20 字，改用本地短句：{}".format(note_ch))
+        else:
+            print("天行每日英语接口不可用（也未申请时返回 160），改用本地短句：{}".format(data))
+    index = date.today().toordinal() % len(SHORT_NOTES)
+    note_ch, note_en = SHORT_NOTES[index]
+    print("本次使用本地短句第 {} 条：{} / {}".format(index + 1, note_ch, note_en))
     return note_ch, note_en
 
 
@@ -529,8 +542,8 @@ if __name__ == "__main__":
     note_ch = config.get("note_ch", "")
     note_en = config.get("note_en", "")
     if not note_ch or not note_en:
-        # 获取词霸每日金句（任一为空即补全，失败会返回本地兜底金句）
-        note_ch, note_en = get_ciba()
+        # 取每日金句（天行优先，失败用本地短句）
+        note_ch, note_en = get_quote()
     w["note_ch"] = note_ch
     w["note_en"] = note_en
     # 彩虹屁只取一次，保证两个收件人看到的内容一致
