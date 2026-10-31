@@ -359,24 +359,23 @@ def get_star():
     return out
 
 
-def get_tianhang():
+def get_morning():
+    """取早安心语（天行数据 zaoan 接口）。失败返回空串，由本地短句兜底。"""
     try:
         key = config["tian_api"]
-        url = "http://api.tianapi.com/caihongpi/index?key={}".format(key)
+        url = "https://apis.tianapi.com/zaoan/index?key={}".format(key)
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                           'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
             'Content-type': 'application/x-www-form-urlencoded'
-
         }
-        response = get_json(url, headers)
+        response = get_json(url, headers, timeout=10, retries=1)
         if isinstance(response, dict) and response.get("code") == 200:
-            chp = response["newslist"][0]["content"]
-        else:
-            chp = ""
-    except (KeyError, IndexError, TypeError):
-        chp = ""
-    return chp
+            return str((response.get("result") or {}).get("content", "")).strip()
+        print("早安心语接口不可用（未申请时返回 160）：{}".format(response))
+    except KeyError:
+        pass
+    return ""
 
 
 def get_birthday(birthday, year, today):
@@ -431,12 +430,12 @@ SHORT_NOTES = [
     ("认真生活的人最可爱", "Live with care"),
 ]
 
-# 彩虹屁原句通常几十字，直接截断会变成半句话，超长时改用这些短句
-SHORT_CHP = [
-    "今天的你闪闪发光",
-    "元气满满的一天",
-    "你笑起来真好看",
-    "今天也是被你可爱到的一天",
+# 早安心语接口不可用时的兜底句子，都在 20 字以内
+SHORT_MORNING = [
+    "早安，今天也要好好吃饭",
+    "新的一天，从认真吃早饭开始",
+    "早安，愿你今天顺顺利利",
+    "早安，阳光正在来的路上",
 ]
 
 
@@ -453,12 +452,23 @@ def clip_sentence(text, limit=MAX_FIELD_LEN):
     return head[:limit]
 
 
-def clip_or_pick(text, pool, limit=MAX_FIELD_LEN):
-    """不超过 limit 就原样返回，超长则换一条同类短句，避免出现截断后的半句话。"""
+def clip_morning(text, limit=MAX_FIELD_LEN):
+    """早安心语的重点在结尾（“早安”），超长时从后往前按标点截，保住收尾。"""
     s = " ".join(str(text).split())
     if len(s) <= limit:
         return s
-    return random.choice(pool)
+    segments = re.split(r"(?<=[，。！？；])", s)
+    tail = ""
+    for seg in reversed(segments):
+        if len(tail) + len(seg) > limit:
+            break
+        tail = seg + tail
+    tail = tail.strip()
+    head = clip_sentence(s)
+    # 保尾至少要有 10 个字才划算，否则还不如从前面多留点内容
+    if len(tail) >= 10:
+        return tail
+    return head
 
 
 def get_quote():
@@ -519,6 +529,7 @@ def send_message(to_user, access_token, w):
         "rain_tip": w.get("rain_tip", ""),
         "proposal": w.get("proposal", ""),
         "chp": w.get("chp", ""),
+        "morning": w.get("morning", ""),
         "star1_name": w.get("star1_name", ""),
         "star1_all": w.get("star1_all", ""),
         "star1_love": w.get("star1_love", ""),
@@ -637,12 +648,13 @@ if __name__ == "__main__":
         note_ch, note_en = get_quote()
     w["note_ch"] = note_ch
     w["note_en"] = note_en
-    # 彩虹屁只取一次，保证两个收件人看到的内容一致；
+    # 早安心语只取一次，保证两个收件人看到的内容一致；
     # 原句普遍超过 20 字，这里按标点截断，宁可短一点也不留半句话
-    chp_raw = get_tianhang()
-    if not chp_raw:
-        chp_raw = random.choice(SHORT_CHP)
-    w["chp"] = clip_sentence(chp_raw)
+    morning = get_morning()
+    if not morning:
+        morning = random.choice(SHORT_MORNING)
+    w["chp"] = clip_morning(morning)
+    w["morning"] = w["chp"]
     w.update(get_star())
     # 公众号推送消息
     for user in users:
